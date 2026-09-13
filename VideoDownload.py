@@ -8,7 +8,7 @@ from typing import Any
 
 try:
     import yt_dlp
-except ImportError:  # Give a friendly error from main() instead of crashing at import time.
+except ImportError:
     yt_dlp = None
 
 try:
@@ -27,14 +27,22 @@ TITLE_NOISE = (
 
 
 def find_songs_folder(base: Path) -> Path | None:
-    """Find the Clone Hero Songs folder without hard-coding Windows path separators."""
-    if base.is_dir() and base.name.lower() == "songs":
-        return base.resolve()
+    """Find the Clone Hero Songs folder from the run directory or its parent."""
+    base = base.resolve()
 
-    for name in ("Songs", "songs"):
-        candidate = base / name
-        if candidate.is_dir():
-            return candidate.resolve()
+    if base.is_dir() and base.name.lower() == "songs":
+        return base
+
+    search_roots = [base]
+    if base.parent != base:
+        search_roots.append(base.parent)
+
+    for root in search_roots:
+        for name in ("Songs", "songs"):
+            candidate = root / name
+            if candidate.is_dir():
+                return candidate.resolve()
+
     return None
 
 
@@ -61,9 +69,7 @@ def read_song_metadata(song_ini: Path) -> tuple[str | None, str | None]:
 
 def clean_folder_title(folder_name: str) -> str:
     title = folder_name.strip()
-    # Common pack numbering, e.g. "01. Artist - Song".
     title = re.sub(r"^\s*\d+\s*[.\-_)]+\s*", "", title)
-    # Common charter suffix, e.g. "[GuitarZero132]".
     title = re.sub(r"\s*\[[^\]]+\]\s*$", "", title)
     for noise in TITLE_NOISE:
         title = title.replace(noise, "")
@@ -82,7 +88,7 @@ def build_search_query(song_ini: Path) -> str:
 
 
 def search_youtube(query: str, limit: int = 5) -> list[dict[str, str]]:
-    """Search YouTube through yt-dlp, replacing the abandoned youtube-search-python dependency."""
+    """Search YouTube through yt-dlp."""
     if yt_dlp is None:
         raise RuntimeError("yt-dlp is not installed")
 
@@ -120,16 +126,12 @@ def search_youtube(query: str, limit: int = 5) -> list[dict[str, str]]:
 
 
 def _format_selector(quality: str) -> str:
-    if quality == "720p":
-        # Prefer a single MP4 stream so 720p can often work even without ffmpeg.
-        return "best[height<=720][ext=mp4]/best[ext=mp4]"
-
-    # 1080p normally requires separate video/audio streams and ffmpeg merging.
-    # Prefer H.264 + M4A for maximum Clone Hero compatibility.
+    """Pick broadly available formats while limiting resolution."""
+    max_height = 720 if quality == "720p" else 1080
     return (
-        "bestvideo[height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/"
-        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-        "best[height<=1080][ext=mp4]"
+        f"bv*[height<=?{max_height}]+ba/"
+        f"b[height<=?{max_height}]/"
+        "bv*+ba/b"
     )
 
 
@@ -142,16 +144,37 @@ def _cleanup_temp_files(song_dir: Path) -> None:
 
 
 def download_candidate(song_dir: Path, url: str, quality: str) -> None:
-    """Download one candidate to a temporary filename, then atomically replace video.mp4."""
+    """Download one candidate, merge/remux to MP4, then replace video.mp4."""
     if yt_dlp is None:
         raise RuntimeError("yt-dlp is not installed")
 
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        raise RuntimeError(
+            "FFmpeg/ffprobe are required. Install them with: "
+            "winget install --id Gyan.FFmpeg -e"
+        )
+
     _cleanup_temp_files(song_dir)
-    temp_template = str(song_dir / ".__chvd_tmp__.%(ext)s")
 
     options: dict[str, Any] = {
-        "outtmpl": temp_template,
+        "outtmpl": str(song_dir / ".__chvd_tmp__.%(ext)s"),
         "format": _format_selector(quality),
+        "format_sort": [
+            "vcodec:h264",
+            "acodec:aac",
+            "lang",
+            "quality",
+            "res",
+            "fps",
+            "hdr:12",
+        ],
+        "merge_output_format": "mp4",
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoRemuxer",
+                "preferedformat": "mp4",
+            }
+        ],
         "noplaylist": True,
         "overwrites": True,
         "retries": 3,
@@ -160,23 +183,19 @@ def download_candidate(song_dir: Path, url: str, quality: str) -> None:
         "no_warnings": False,
     }
 
-    if quality == "1080p":
-        options["merge_output_format"] = "mp4"
-
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
 
         temp_mp4 = song_dir / ".__chvd_tmp__.mp4"
         if not temp_mp4.exists():
-            mp4_candidates = list(song_dir.glob(".__chvd_tmp__*.mp4"))
-            if len(mp4_candidates) == 1:
-                temp_mp4 = mp4_candidates[0]
-            else:
-                raise RuntimeError("yt-dlp completed but did not produce an MP4 file")
+            candidates = sorted(song_dir.glob(".__chvd_tmp__*"))
+            raise RuntimeError(
+                "yt-dlp completed but did not produce an MP4 file. "
+                f"Temporary outputs: {[p.name for p in candidates]}"
+            )
 
-        final_video = song_dir / "video.mp4"
-        os.replace(temp_mp4, final_video)
+        os.replace(temp_mp4, song_dir / "video.mp4")
     finally:
         _cleanup_temp_files(song_dir)
 
@@ -218,8 +237,13 @@ def dependency_hints() -> list[str]:
     hints: list[str] = []
     if shutil.which("deno") is None:
         hints.append(
-            "Deno was not found. Modern yt-dlp needs an external JavaScript runtime for full "
-            "YouTube support; Deno is the recommended option."
+            "Deno was not found. Modern yt-dlp needs a supported JavaScript runtime "
+            "for full YouTube support."
+        )
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        hints.append(
+            "FFmpeg/ffprobe were not found. Install them with: "
+            "winget install --id Gyan.FFmpeg -e"
         )
     return hints
 
@@ -230,8 +254,14 @@ def explain_youtube_error(exc: Exception) -> str:
     if "sign in" in lowered or "precondition check failed" in lowered or "bot" in lowered:
         return (
             f"{message}\n"
-            "YouTube rejected the request. Update yt-dlp[default] and make sure Deno is installed "
-            "and available in PATH."
+            "YouTube rejected the request. Update yt-dlp[default] and make sure Deno "
+            "is installed and available in PATH."
+        )
+    if "requested format is not available" in lowered:
+        return (
+            f"{message}\n"
+            "The video did not expose a compatible format with the current selector. "
+            "Make sure this repo is up to date and FFmpeg is installed."
         )
     return message
 
@@ -239,7 +269,7 @@ def explain_youtube_error(exc: Exception) -> str:
 def choose_mode() -> tuple[str, bool] | None:
     print(
         "Type the number to pick from the following options:\n"
-        "1. Default quality (720p)\n"
+        "1. Default quality (up to 720p)\n"
         "2. Best quality (up to 1080p, where available)\n"
         "3. Replace existing videos with up to 1080p\n"
     )
@@ -256,7 +286,7 @@ def choose_mode() -> tuple[str, bool] | None:
 
 def main() -> int:
     if yt_dlp is None or tqdm is None:
-        print("Missing Python dependencies. Run: py -m pip install -U -r requirements.txt")
+        print("Missing Python dependencies. Run: python -m pip install -U -r requirements.txt")
         return 2
 
     print(f"yt-dlp version: {getattr(getattr(yt_dlp, 'version', None), '__version__', 'unknown')}")
@@ -266,16 +296,26 @@ def main() -> int:
     print("Checking for Songs folder...")
     songs_folder = find_songs_folder(Path.cwd())
     if songs_folder is None:
-        print("Did not detect a 'Songs' folder. Run this one level above your Clone Hero Songs folder.")
+        print(
+            "Did not detect a 'Songs' folder. Run this from the Clone Hero drive root "
+            "or from the CloneHeroVideoDownloader folder beside Songs."
+        )
         return 2
+
+    print(f"Songs folder: {songs_folder}")
 
     mode = choose_mode()
     if mode is None:
         return 2
     quality, replace_existing = mode
 
-    if quality == "1080p" and shutil.which("ffmpeg") is None:
-        print("1080p mode requires the ffmpeg executable in PATH. Install ffmpeg and try again.")
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        print(
+            "This version requires FFmpeg for reliable YouTube format handling.\n"
+            "Install it with:\n"
+            "  winget install --id Gyan.FFmpeg -e\n"
+            "Then close/reopen PowerShell and run the downloader again."
+        )
         return 2
 
     song_files = list(songs_folder.rglob("song.ini"))
@@ -297,8 +337,9 @@ def main() -> int:
             try:
                 results = search_youtube(query, limit=5)
             except Exception as exc:
-                errors.append((song_name, explain_youtube_error(exc)))
-                print(f"Search failed for {song_name}: {errors[-1][1]}")
+                error = explain_youtube_error(exc)
+                errors.append((song_name, error))
+                print(f"Search failed for {song_name}: {error}")
                 progress.update(1)
                 continue
 
@@ -311,6 +352,7 @@ def main() -> int:
 
             success = False
             last_error = "No candidate succeeded."
+
             for result in results[:3]:
                 print(f"Trying: {result['title']}")
                 try:
